@@ -5569,6 +5569,7 @@ html.activity-indicators-disabled .terminal-pane-activity {
   scrollbar-width: none;
   align-items: center;
   -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
 }
 
 .terminal-groups-tabs::-webkit-scrollbar {

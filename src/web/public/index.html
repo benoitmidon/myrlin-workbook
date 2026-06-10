@@ -1742,10 +1742,10 @@
        same-phase listener for the xterm case only. -->
   <script>
     (function () {
-      var inXterm = function (el) {
-        return el && el.closest && el.closest('.xterm-viewport, .xterm-screen');
+      var shouldBlock = function (el) {
+        return el && el.closest && el.closest('.xterm-viewport, .xterm-screen, .terminal-groups-tabs');
       };
-      var stop = function (e) { if (inXterm(e.target)) e.stopImmediatePropagation(); };
+      var stop = function (e) { if (shouldBlock(e.target)) e.stopImmediatePropagation(); };
       document.addEventListener('touchstart', stop, { passive: true });
       document.addEventListener('touchmove', stop, { passive: true });
       document.addEventListener('touchend', stop, { passive: true });

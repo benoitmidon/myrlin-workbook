@@ -14907,6 +14907,11 @@ class CWMApp {
       tab.addEventListener('click', () => this.switchTerminalGroup(tab.dataset.groupId));
 
       // ── Drag-to-reorder tabs ──
+      // On touch devices, skip drag entirely — it conflicts with native horizontal
+      // scroll on the tab strip. The DragDropTouch polyfill intercepts touch events
+      // on the whole document, so even draggable=false + drag listeners would block scroll.
+      const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+      if (!isTouch) {
       tab.draggable = true;
       tab.addEventListener('dragstart', (e) => {
         e.dataTransfer.setData('text/tab-group-id', tab.dataset.groupId);
@@ -14998,6 +15003,7 @@ class CWMApp {
           this._reorderTabGroup(draggedId, targetId);
         }
       });
+      } // end if (!isTouch) — drag-to-reorder
 
       // Double-click to rename
       tab.addEventListener('dblclick', (e) => {
