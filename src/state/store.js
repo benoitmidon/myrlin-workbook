@@ -10,6 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
 const docsManager = require('./docs-manager');
+const sessionDb = require('./session-db');
 const { expandHome } = require('../utils/path-utils');
 const { getDataDir, migrateFromLegacy } = require('../utils/data-dir');
 
@@ -185,6 +186,10 @@ class Store extends EventEmitter {
     }
     this._recordDiskMtime();
     this._recordWorkspaceBaseline();
+    // Sync existing session→transcript bindings into SQLite on startup.
+    // This seeds the DB from the JSON store so the uniqueness constraint
+    // covers pre-existing data, not just new writes.
+    this._syncSessionDb();
     return this;
   }
 
@@ -255,6 +260,29 @@ class Store extends EventEmitter {
       this._lastKnownWorkspaceCount = Object.keys((this._state && this._state.workspaces) || {}).length;
     } catch (_) {
       this._lastKnownWorkspaceCount = 0;
+    }
+  }
+
+  /**
+   * Seed the SQLite session DB from the JSON store on startup.
+   * Non-fatal: if SQLite fails, the JSON store still works.
+   */
+  _syncSessionDb() {
+    try {
+      const sessions = this._state.sessions || {};
+      let synced = 0;
+      for (const [id, s] of Object.entries(sessions)) {
+        if (s.resumeSessionId) {
+          const result = sessionDb.bindTranscript(id, s.resumeSessionId, {
+            sessionName: s.name,
+            workingDir: s.workingDir,
+          });
+          if (result.ok) synced++;
+        }
+      }
+      console.log(`[Store] Synced ${synced} session→transcript bindings to SQLite`);
+    } catch (e) {
+      console.warn(`[Store] SQLite sync failed (non-fatal): ${e.message}`);
     }
   }
 
@@ -949,8 +977,7 @@ class Store extends EventEmitter {
     if (!session) return null;
 
     // Uniqueness constraint: reject resumeSessionId already owned by another session.
-    // Without this, concurrent backfills after a service restart can bind multiple
-    // Myrlin sessions to the same Claude transcript (race condition).
+    // Enforced both in-memory (JSON) and in SQLite for durability.
     if (updates.resumeSessionId) {
       const conflict = Object.values(this._state.sessions).find(s =>
         s.id !== id && s.resumeSessionId === updates.resumeSessionId
@@ -961,6 +988,19 @@ class Store extends EventEmitter {
           `already owned by session ${conflict.id} ("${conflict.name || ''}")`
         );
         return null;
+      }
+      // Register in SQLite (double safety net with history log)
+      try {
+        const result = sessionDb.bindTranscript(id, updates.resumeSessionId, {
+          sessionName: updates.name || session.name,
+          workingDir: updates.workingDir || session.workingDir,
+        });
+        if (!result.ok) {
+          console.warn(`[Store] SQLite rejected binding: ${result.error}`);
+          return null;
+        }
+      } catch (e) {
+        console.warn(`[Store] SQLite bindTranscript failed (non-fatal): ${e.message}`);
       }
     }
 
