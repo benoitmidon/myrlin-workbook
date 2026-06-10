@@ -948,6 +948,22 @@ class Store extends EventEmitter {
     const session = this._state.sessions[id];
     if (!session) return null;
 
+    // Uniqueness constraint: reject resumeSessionId already owned by another session.
+    // Without this, concurrent backfills after a service restart can bind multiple
+    // Myrlin sessions to the same Claude transcript (race condition).
+    if (updates.resumeSessionId) {
+      const conflict = Object.values(this._state.sessions).find(s =>
+        s.id !== id && s.resumeSessionId === updates.resumeSessionId
+      );
+      if (conflict) {
+        console.warn(
+          `[Store] Rejecting resumeSessionId=${updates.resumeSessionId} for session ${id}: ` +
+          `already owned by session ${conflict.id} ("${conflict.name || ''}")`
+        );
+        return null;
+      }
+    }
+
     // Handle workspace move - update both workspace session arrays
     if (updates.workspaceId && updates.workspaceId !== session.workspaceId) {
       const oldWs = this._state.workspaces[session.workspaceId];

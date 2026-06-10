@@ -5568,6 +5568,7 @@ html.activity-indicators-disabled .terminal-pane-activity {
   overflow-x: auto;
   scrollbar-width: none;
   align-items: center;
+  -webkit-overflow-scrolling: touch;
 }
 
 .terminal-groups-tabs::-webkit-scrollbar {
@@ -5589,10 +5590,12 @@ html.activity-indicators-disabled .terminal-pane-activity {
   white-space: nowrap;
   transition: all var(--transition-fast);
   position: relative;
-  /* Touch: let DragDropTouch polyfill handle long-press-to-drag without the
-     browser claiming the gesture for the scrollable tab strip.
+  /* Touch: allow horizontal swipe to scroll the tab strip on mobile.
+     DragDropTouch polyfill uses long-press to initiate drag, which doesn't
+     conflict with pan-x. The previous touch-action:none blocked all native
+     scrolling on iOS/iPadOS.
   */
-  touch-action: none;
+  touch-action: pan-x;
 }
 
 .terminal-group-tab::before {

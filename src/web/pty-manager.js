@@ -14,6 +14,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { resolveProjectPath } = require('../providers/claude/path-decode');
 
 // Ensure node-pty's prebuilt spawn-helper is executable BEFORE requiring node-pty.
 // node-pty's prebuild ships with mode 644 instead of 755, causing posix_spawnp
@@ -252,6 +253,11 @@ class PtySession {
 class PtySessionManager {
   constructor() {
     this.sessions = new Map(); // sessionId -> PtySession
+    // Per-cwd lock to serialize JSONL backfill operations. When multiple sessions
+    // share the same workingDir and start simultaneously (e.g. after a service
+    // restart), without serialization they race to claim the same new JSONL file.
+    // Key: normalized cwd path. Value: Promise chain.
+    this._backfillLocks = new Map();
   }
 
   /**
@@ -673,12 +679,13 @@ class PtySessionManager {
       const findCandidateDirs = () => {
         try {
           if (!fs.existsSync(claudeDir)) return [];
+          const normalizedCwd = resolvedCwd.replace(/[/\\]/g, path.sep).replace(/[/\\]$/, '').toLowerCase();
           return fs.readdirSync(claudeDir).filter(d => {
             try {
-              const decoded = decodeURIComponent(d);
-              const normalizedDecoded = decoded.replace(/[/\\]/g, path.sep);
-              const normalizedCwd = resolvedCwd.replace(/[/\\]/g, path.sep);
-              return normalizedDecoded === normalizedCwd;
+              const projDir = path.join(claudeDir, d);
+              const resolved = resolveProjectPath(projDir, d);
+              const normalizedResolved = resolved.replace(/[/\\]/g, path.sep).replace(/[/\\]$/, '').toLowerCase();
+              return normalizedResolved === normalizedCwd;
             } catch (_) {
               return false;
             }
@@ -706,45 +713,54 @@ class PtySessionManager {
             console.log(`[PTY] No new JSONL appeared for ${sessionId}; skipping resumeSessionId backfill`);
             return;
           }
-          const uuid = hit.file.replace('.jsonl', '');
-          console.log(`[PTY] Detected Claude session UUID for ${sessionId}: ${uuid}`);
 
-          // Save to store so future restarts use --resume <uuid>.
-          // Defensive: refuse to backfill if another Myrlin session already
-          // owns this UUID. That shouldn't be possible now that the snapshot
-          // diff filters pre-existing JSONLs, but the check is cheap and
-          // prevents two sessions from ever pointing at the same transcript.
-          let backfilled = false;
-          try {
-            const store = getStore();
-            const conflict = store.getAllSessionsList().find(s =>
-              s.id !== sessionId && s.resumeSessionId === uuid
-            );
-            if (conflict) {
-              console.warn(
-                `[PTY] Refusing to backfill resumeSessionId=${uuid} for session ${sessionId}: ` +
-                `already owned by session ${conflict.id} ("${conflict.name || ''}")`
-              );
-            } else if (store.getSession(sessionId)) {
-              store.updateSession(sessionId, { resumeSessionId: uuid });
-              console.log(`[PTY] Backfilled resumeSessionId=${uuid} for session ${sessionId}`);
-              backfilled = true;
-            }
-          } catch (_) {}
+          // Serialize backfill operations per cwd to prevent race conditions.
+          // When multiple sessions share the same workingDir and start simultaneously
+          // (e.g. after service restart), they all detect the same new JSONL file.
+          // The per-cwd promise chain ensures only one session can claim a given UUID.
+          const lockKey = resolvedCwd;
+          const prev = this._backfillLocks.get(lockKey) || Promise.resolve();
+          const current = prev.then(() => {
+            const uuid = hit.file.replace('.jsonl', '');
+            console.log(`[PTY] Detected Claude session UUID for ${sessionId}: ${uuid}`);
 
-          if (!backfilled) return;
-
-          // Also store on the session object for layout saves
-          session.detectedResumeId = uuid;
-
-          // Notify connected clients so the frontend can update its
-          // spawnOpts for accurate layout persistence on restart.
-          const backfillMsg = JSON.stringify({ type: 'resumeId', resumeSessionId: uuid });
-          for (const ws of session.clients) {
+            let backfilled = false;
             try {
-              if (ws.readyState === 1) ws.send(backfillMsg);
+              const store = getStore();
+              const conflict = store.getAllSessionsList().find(s =>
+                s.id !== sessionId && s.resumeSessionId === uuid
+              );
+              if (conflict) {
+                console.warn(
+                  `[PTY] Refusing to backfill resumeSessionId=${uuid} for session ${sessionId}: ` +
+                  `already owned by session ${conflict.id} ("${conflict.name || ''}")`
+                );
+              } else if (store.getSession(sessionId)) {
+                const updated = store.updateSession(sessionId, { resumeSessionId: uuid });
+                if (updated) {
+                  console.log(`[PTY] Backfilled resumeSessionId=${uuid} for session ${sessionId}`);
+                  backfilled = true;
+                } else {
+                  console.warn(`[PTY] Store rejected backfill resumeSessionId=${uuid} for session ${sessionId} (uniqueness constraint)`);
+                }
+              }
             } catch (_) {}
-          }
+
+            if (!backfilled) return;
+
+            // Also store on the session object for layout saves
+            session.detectedResumeId = uuid;
+
+            // Notify connected clients so the frontend can update its
+            // spawnOpts for accurate layout persistence on restart.
+            const backfillMsg = JSON.stringify({ type: 'resumeId', resumeSessionId: uuid });
+            for (const ws of session.clients) {
+              try {
+                if (ws.readyState === 1) ws.send(backfillMsg);
+              } catch (_) {}
+            }
+          }).catch(() => {});
+          this._backfillLocks.set(lockKey, current);
         }
       );
       session._cancelWatch = cancelWatch;
