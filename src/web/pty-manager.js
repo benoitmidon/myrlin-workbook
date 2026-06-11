@@ -343,7 +343,21 @@ class PtySessionManager {
     // codexProvider.spawnCommand instead of the inline path). gsd:provider-literal-allowed
     const registry = require('../providers');
     const candidateProvider = registry.getProvider(providerId);
-    const useProvider = !!(candidateProvider && candidateProvider.cliBinary === command);
+    // Match the provider when the command IS the CLI binary or STARTS WITH it
+    // (e.g. "claude --allow-dangerously-skip-permissions" still matches "claude").
+    // Without this, sessions with extra CLI flags bypass the provider path and
+    // lose --resume, --model, and all provider-managed spawn logic.
+    const commandTokens = command.split(/\s+/);
+    const commandBase = commandTokens[0];
+    const useProvider = !!(candidateProvider && candidateProvider.cliBinary === commandBase);
+    // Extract inline flags from the command string so they aren't lost when
+    // the provider path builds its own descriptor (which ignores command flags).
+    if (useProvider && commandTokens.length > 1) {
+      const inlineFlags = commandTokens.slice(1);
+      if (inlineFlags.includes('--dangerously-skip-permissions') || inlineFlags.includes('--allow-dangerously-skip-permissions')) {
+        bypassPermissions = true;
+      }
+    }
     const provider = useProvider ? candidateProvider : null;
     if (providerId && !candidateProvider) {
       // The session is tagged with an unknown/unregistered provider id.
@@ -786,7 +800,7 @@ class PtySessionManager {
         const store = getStore();
         const storeSession = store.getSession(sessionId);
         if (storeSession) {
-          console.log(`[PTY] Spawning from store data for ${sessionId}: resumeSessionId=${storeSession.resumeSessionId}, cwd=${storeSession.workingDir}, cmd=${storeSession.command}`);
+          console.log(`[PTY] Spawning from store data for ${sessionId}: resumeSessionId=${storeSession.resumeSessionId}, cwd=${storeSession.workingDir}, cmd=${storeSession.command}, spawnOpts=${JSON.stringify(spawnOpts)}`);
           session = this.spawnSession(sessionId, {
             command: storeSession.command || 'claude', // gsd:provider-literal-allowed (v1.1 back-compat default)
             cwd: storeSession.workingDir || undefined,
