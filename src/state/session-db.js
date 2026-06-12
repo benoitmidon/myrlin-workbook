@@ -33,13 +33,14 @@ function getDb() {
   _db = new DatabaseSync(DB_PATH);
   _db.exec(`
     CREATE TABLE IF NOT EXISTS session_transcript (
-      session_id        TEXT PRIMARY KEY,
-      resume_session_id TEXT UNIQUE,
-      session_name      TEXT,
-      first_message     TEXT,
-      working_dir       TEXT,
-      created_at        TEXT DEFAULT (datetime('now')),
-      updated_at        TEXT DEFAULT (datetime('now'))
+      session_id             TEXT PRIMARY KEY,
+      resume_session_id      TEXT UNIQUE,
+      session_name           TEXT,
+      first_message          TEXT,
+      working_dir            TEXT,
+      conversation_started_at TEXT,
+      created_at             TEXT DEFAULT (datetime('now')),
+      updated_at             TEXT DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS session_history (
@@ -51,6 +52,12 @@ function getDb() {
       timestamp         TEXT DEFAULT (datetime('now'))
     );
   `);
+  // Migration: add conversation_started_at column if missing (existing DBs)
+  try {
+    _db.exec(`ALTER TABLE session_transcript ADD COLUMN conversation_started_at TEXT`);
+  } catch (_) {
+    // Column already exists — ignore
+  }
   return _db;
 }
 
@@ -66,7 +73,7 @@ function getDb() {
  * @param {string} [workingDir] - Session working directory
  * @returns {{ ok: boolean, error?: string, conflictSession?: string }}
  */
-function bindTranscript(sessionId, resumeSessionId, { sessionName, firstMessage, workingDir } = {}) {
+function bindTranscript(sessionId, resumeSessionId, { sessionName, firstMessage, workingDir, conversationStartedAt } = {}) {
   const db = getDb();
 
   // Check if this session already has a binding — once set, never change
@@ -111,8 +118,8 @@ function bindTranscript(sessionId, resumeSessionId, { sessionName, firstMessage,
 
   // Insert-only — once created, never modified
   db.prepare(
-    'INSERT INTO session_transcript (session_id, resume_session_id, session_name, first_message, working_dir) VALUES (?, ?, ?, ?, ?)'
-  ).run(sessionId, resumeSessionId, sessionName || null, firstMessage || null, workingDir || null);
+    'INSERT INTO session_transcript (session_id, resume_session_id, session_name, first_message, working_dir, conversation_started_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(sessionId, resumeSessionId, sessionName || null, firstMessage || null, workingDir || null, conversationStartedAt || null);
 
   // Log
   db.prepare(
@@ -153,6 +160,81 @@ function getTranscript(sessionId) {
 // as a historical record to prevent the transcript from being reclaimed.
 
 /**
+ * Read metadata from a Claude JSONL transcript file.
+ * Extracts the first user message and conversation start timestamp.
+ * @param {string} jsonlPath - Absolute path to the .jsonl file
+ * @returns {{ firstMessage: string|null, startedAt: string|null }}
+ */
+function readJsonlMeta(jsonlPath) {
+  const fs = require('fs');
+  let firstMessage = null;
+  let startedAt = null;
+  try {
+    const content = fs.readFileSync(jsonlPath, 'utf8');
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      const d = JSON.parse(line);
+      // Get timestamp from the first entry
+      if (!startedAt && d.timestamp) {
+        startedAt = d.timestamp;
+      }
+      // Get first user message
+      if (!firstMessage && d.type === 'user' && d.message && typeof d.message === 'object') {
+        const c = d.message.content;
+        if (typeof c === 'string' && c.trim()) {
+          firstMessage = c.substring(0, 500);
+          break;
+        } else if (Array.isArray(c)) {
+          for (const item of c) {
+            if (item && item.type === 'text' && item.text && item.text.trim()) {
+              firstMessage = item.text.substring(0, 500);
+              break;
+            }
+          }
+          if (firstMessage) break;
+        }
+      }
+    }
+  } catch (_) {}
+  return { firstMessage, startedAt };
+}
+
+/**
+ * Backfill first_message and conversation_started_at for existing bindings
+ * that are missing this data. Call on startup.
+ * @param {string} claudeProjectsDir - Path to ~/.claude/projects/
+ */
+function backfillMeta(claudeProjectsDir) {
+  const fs = require('fs');
+  const scanPath = require('path');
+  const db = getDb();
+  const rows = db.prepare(
+    'SELECT session_id, resume_session_id FROM session_transcript WHERE first_message IS NULL OR conversation_started_at IS NULL'
+  ).all();
+  let filled = 0;
+  for (const row of rows) {
+    // Find the JSONL file
+    try {
+      const dirs = fs.readdirSync(claudeProjectsDir);
+      for (const d of dirs) {
+        const jsonlPath = scanPath.join(claudeProjectsDir, d, row.resume_session_id + '.jsonl');
+        if (fs.existsSync(jsonlPath)) {
+          const meta = readJsonlMeta(jsonlPath);
+          if (meta.firstMessage || meta.startedAt) {
+            db.prepare(
+              'UPDATE session_transcript SET first_message = COALESCE(first_message, ?), conversation_started_at = COALESCE(conversation_started_at, ?) WHERE session_id = ?'
+            ).run(meta.firstMessage, meta.startedAt, row.session_id);
+            filled++;
+          }
+          break;
+        }
+      }
+    } catch (_) {}
+  }
+  if (filled > 0) console.log(`[SessionDB] Backfilled metadata for ${filled} bindings`);
+}
+
+/**
  * Get full history for debugging.
  * @param {number} [limit=50]
  * @returns {Array}
@@ -185,11 +267,24 @@ function close() {
   }
 }
 
+/**
+ * Update the session name in the DB (for rename sync from UI).
+ * @param {string} sessionId
+ * @param {string} newName
+ */
+function updateName(sessionId, newName) {
+  const db = getDb();
+  db.prepare('UPDATE session_transcript SET session_name = ? WHERE session_id = ?').run(newName, sessionId);
+}
+
 module.exports = {
   bindTranscript,
   findOwner,
   getTranscript,
   getHistory,
   getAllBindings,
+  readJsonlMeta,
+  backfillMeta,
+  updateName,
   close,
 };

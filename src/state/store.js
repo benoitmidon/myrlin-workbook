@@ -190,6 +190,14 @@ class Store extends EventEmitter {
     // This seeds the DB from the JSON store so the uniqueness constraint
     // covers pre-existing data, not just new writes.
     this._syncSessionDb();
+    // Backfill first_message and conversation_started_at for bindings missing metadata
+    try {
+      const os = require('os');
+      const scanPath = require('path');
+      sessionDb.backfillMeta(scanPath.join(os.homedir(), '.claude', 'projects'));
+    } catch (e) {
+      console.warn(`[Store] SQLite backfillMeta failed (non-fatal): ${e.message}`);
+    }
     // Periodic scan for sessions missing resumeSessionId — matches them to
     // orphan JSONL files by working directory. This is the reliable fallback
     // for the fs.watch-based backfill which often misses (Claude Code creates
@@ -1101,6 +1109,12 @@ class Store extends EventEmitter {
     }
 
     Object.assign(session, updates, { lastActive: new Date().toISOString() });
+    // Sync name changes to SQLite so the DB stays in sync with the UI
+    if (updates.name && session.resumeSessionId) {
+      try {
+        sessionDb.updateName(id, updates.name);
+      } catch (_) {}
+    }
     // Status changes and workspace moves save immediately, other updates debounce
     if (updates.status || updates.pid !== undefined || updates.workspaceId) {
       this.save();
