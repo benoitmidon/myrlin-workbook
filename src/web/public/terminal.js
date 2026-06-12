@@ -385,7 +385,28 @@ class TerminalPane {
         // Ctrl+C / Cmd+C: copy selected text to clipboard (if selection exists)
         // Without selection, fall through so xterm sends \x03 (SIGINT) normally
         if (mod && e.key === 'c' && this.term.hasSelection()) {
-          navigator.clipboard.writeText(this.term.getSelection()).catch(() => {});
+          const text = this.term.getSelection();
+          // Try modern clipboard API first, fall back to execCommand for
+          // contexts where navigator.clipboard is blocked (e.g. Cloudflare tunnels)
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(() => {
+              const ta = document.createElement('textarea');
+              ta.value = text;
+              ta.style.cssText = 'position:fixed;left:-9999px';
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand('copy');
+              document.body.removeChild(ta);
+            });
+          } else {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.cssText = 'position:fixed;left:-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+          }
           this.term.clearSelection();
           return false;
         }
