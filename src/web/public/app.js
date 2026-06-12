@@ -11496,15 +11496,29 @@ class CWMApp {
       sessionName = savedTitle;
     }
     console.log('[DnD] openTerminalInPane slot:', slotIdx, 'session:', sessionId, 'name:', sessionName);
+    // If this session is already open in a pane, just activate it
+    const existingIdx = this.terminalPanes.findIndex(p => p && p.sessionId === sessionId && !p._lazy);
+    if (existingIdx !== -1) {
+      this.setActiveTerminalPane(existingIdx);
+      return;
+    }
     // If the target slot already has an active terminal, find the next empty slot
     if (this.terminalPanes[slotIdx]) {
       const emptySlot = this.terminalPanes.findIndex(p => p === null);
       if (emptySlot !== -1) {
         slotIdx = emptySlot;
       } else {
-        // All slots full, replace the target slot
-        this.terminalPanes[slotIdx].dispose();
-        this.terminalPanes[slotIdx] = null;
+        // Try to find a lazy placeholder to replace instead of an active terminal
+        const lazySlot = this.terminalPanes.findIndex(p => p && p._lazy);
+        if (lazySlot !== -1) {
+          this.terminalPanes[lazySlot].dispose();
+          this.terminalPanes[lazySlot] = null;
+          slotIdx = lazySlot;
+        } else {
+          // All slots full with active terminals, replace the target slot
+          this.terminalPanes[slotIdx].dispose();
+          this.terminalPanes[slotIdx] = null;
+        }
       }
     }
 
