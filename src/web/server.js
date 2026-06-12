@@ -8217,6 +8217,25 @@ function onProviderDiscoverChange(providerId) {
   try { broadcastSSE('discover:refreshed', { provider: providerId }); } catch (_) {}
 }
 
+// Session metadata from SQLite (first_message, conversation_started_at)
+app.get('/api/session-meta', requireAuth, (req, res) => {
+  try {
+    const sessionDb = require('../state/session-db');
+    const bindings = sessionDb.getAllBindings();
+    const meta = {};
+    for (const b of bindings) {
+      meta[b.session_id] = {
+        firstMessage: b.first_message,
+        conversationStartedAt: b.conversation_started_at,
+        resumeSessionId: b.resume_session_id,
+      };
+    }
+    res.json(meta);
+  } catch (e) {
+    res.json({});
+  }
+});
+
 module.exports = {
   app,
   startServer,

@@ -1944,8 +1944,13 @@ class CWMApp {
     // terminal.js. Fetching before initTerminalGroups means real specs are
     // available for both Claude and Codex panes on first paint.
     await this.fetchProviderSpecs();
-    // Terminal group restore spawns PTY sessions and can be slow.
-    // Run it in the background so login resolves immediately.
+    // Load session metadata from SQLite for lazy placeholders
+    try {
+      this._sessionMeta = await this.api('GET', '/api/session-meta');
+    } catch (_) {
+      this._sessionMeta = {};
+    }
+    // Terminal group restore shows lazy placeholders (no PTY spawn).
     this.initTerminalGroups().catch(e => console.error('Terminal groups init:', e));
     this.initTerminalPaneSwipe();
     this.initNotesEditor();
@@ -11418,6 +11423,43 @@ class CWMApp {
   // (wrong pane on reconnect, unclosable panes, broken layout). Panes now connect
   // directly on restore and close cleanly on fatal error.
 
+  /**
+   * Show a lazy placeholder for a session pane. The actual terminal connection
+   * is deferred until the user clicks on the pane. This prevents spawning all
+   * sessions at once when opening a tab group.
+   */
+  showLazyPlaceholder(slotIdx, sessionId, sessionName, spawnOpts) {
+    const paneEl = document.getElementById(`term-pane-${slotIdx}`);
+    if (!paneEl) return;
+    paneEl.hidden = false;
+    paneEl.classList.remove('terminal-pane-empty');
+    paneEl.classList.add('terminal-pane-lazy');
+    const titleEl = paneEl.querySelector('.terminal-pane-title');
+    if (titleEl) titleEl.textContent = sessionName || sessionId;
+    const closeBtn = paneEl.querySelector('.terminal-pane-close');
+    if (closeBtn) closeBtn.hidden = false;
+    // Show placeholder with first message if available
+    const termContainer = document.getElementById(`term-container-${slotIdx}`);
+    if (termContainer) {
+      const meta = this._sessionMeta && this._sessionMeta[sessionId];
+      const firstMsg = meta && meta.firstMessage ? meta.firstMessage.substring(0, 200) : '';
+      const startedAt = meta && meta.conversationStartedAt ? new Date(meta.conversationStartedAt).toLocaleDateString() : '';
+      termContainer.innerHTML = `<div class="lazy-placeholder" style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--subtext0);cursor:pointer;user-select:none;padding:20px;text-align:center;gap:12px;">
+        <div style="font-size:13px;opacity:0.6;max-width:400px;line-height:1.4;font-style:italic;">${firstMsg ? '&ldquo;' + firstMsg.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '&hellip;&rdquo;' : ''}</div>
+        ${startedAt ? '<div style="font-size:11px;opacity:0.4;">' + startedAt + '</div>' : ''}
+        <div style="font-size:14px;margin-top:8px;">Click to connect</div>
+      </div>`;
+    }
+    // Activate on click
+    const activateHandler = () => {
+      paneEl.classList.remove('terminal-pane-lazy');
+      if (termContainer) termContainer.innerHTML = '';
+      this.openTerminalInPane(slotIdx, sessionId, sessionName, spawnOpts);
+      paneEl.removeEventListener('click', activateHandler);
+    };
+    paneEl.addEventListener('click', activateHandler);
+  }
+
   openTerminalInPane(slotIdx, sessionId, sessionName, spawnOpts) {
     // Check localStorage for a previously saved name for this session
     const savedTitle = this.getProjectSessionTitle(sessionId);
@@ -14747,7 +14789,9 @@ class CWMApp {
           // inside openTerminalInPane handles that case (lookup-then-claude).
           const opts = { ...(p.spawnOpts || {}) };
           if (p.provider && !opts.provider) opts.provider = p.provider;
-          this.openTerminalInPane(p.slot, p.sessionId, p.sessionName || 'Terminal', opts);
+          // Lazy spawn: show placeholder instead of connecting immediately.
+          // The terminal only connects when the user clicks on the pane.
+          this.showLazyPlaceholder(p.slot, p.sessionId, p.sessionName || 'Terminal', opts);
           if (p.viewType) {
             setTimeout(() => this.openViewInPane(p.slot, p.viewType, p.viewData || {}), 100);
           }
@@ -15185,12 +15229,12 @@ class CWMApp {
         }
       });
     } else {
-      // No cache, create fresh connections (first time opening this group)
+      // No cache — show lazy placeholders (connect only on click)
       const group = this._tabGroups.find(g => g.id === groupId);
       if (group && group.panes) {
         group.panes.forEach(p => {
           if (p.sessionId && !this.terminalPanes[p.slot]) {
-            this.openTerminalInPane(p.slot, p.sessionId, p.sessionName || 'Terminal', p.spawnOpts || {});
+            this.showLazyPlaceholder(p.slot, p.sessionId, p.sessionName || 'Terminal', p.spawnOpts || {});
           }
         });
       }
