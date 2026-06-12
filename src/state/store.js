@@ -190,6 +190,11 @@ class Store extends EventEmitter {
     // This seeds the DB from the JSON store so the uniqueness constraint
     // covers pre-existing data, not just new writes.
     this._syncSessionDb();
+    // Periodic scan for sessions missing resumeSessionId — matches them to
+    // orphan JSONL files by working directory. This is the reliable fallback
+    // for the fs.watch-based backfill which often misses (Claude Code creates
+    // the JSONL only on first message, not at spawn time).
+    this._startOrphanScan();
     return this;
   }
 
@@ -284,6 +289,86 @@ class Store extends EventEmitter {
     } catch (e) {
       console.warn(`[Store] SQLite sync failed (non-fatal): ${e.message}`);
     }
+  }
+
+  /**
+   * Periodically scan for sessions missing resumeSessionId and match them to
+   * orphan JSONL files. Runs every 30s. This is the reliable fallback for
+   * the fs.watch backfill which often misses because Claude Code creates the
+   * JSONL only on the first user message, not at process spawn time.
+   */
+  _startOrphanScan() {
+    const os = require('os');
+    const scanFs = require('fs');
+    const scanPath = require('path');
+    const claudeDir = scanPath.join(os.homedir(), '.claude', 'projects');
+
+    this._orphanScanInterval = setInterval(() => {
+      try {
+        const sessions = this._state.sessions || {};
+        // Collect all resumeSessionIds already in use
+        const usedIds = new Set();
+        for (const s of Object.values(sessions)) {
+          if (s.resumeSessionId) usedIds.add(s.resumeSessionId);
+        }
+
+        // Find sessions without resumeSessionId that have a workingDir
+        const orphanSessions = Object.entries(sessions).filter(
+          ([, s]) => !s.resumeSessionId && s.workingDir && s.status === 'running'
+        );
+        if (orphanSessions.length === 0) return;
+
+        for (const [sid, session] of orphanSessions) {
+          const cwd = session.workingDir;
+          // Find the Claude project dir matching this cwd
+          if (!scanFs.existsSync(claudeDir)) continue;
+          const candidateDirs = scanFs.readdirSync(claudeDir).filter(d => {
+            try {
+              const decoded = decodeURIComponent(d);
+              return decoded.replace(/[/\\]/g, scanPath.sep) === cwd.replace(/[/\\]/g, scanPath.sep);
+            } catch (_) { return false; }
+          });
+
+          // Collect all JSONL UUIDs in candidate dirs, sorted newest first
+          const jsonls = [];
+          for (const dirName of candidateDirs) {
+            try {
+              for (const f of scanFs.readdirSync(scanPath.join(claudeDir, dirName))) {
+                if (!f.endsWith('.jsonl')) continue;
+                const uuid = f.replace('.jsonl', '');
+                if (usedIds.has(uuid)) continue; // Already claimed
+                const stat = scanFs.statSync(scanPath.join(claudeDir, dirName, f));
+                // Only consider JSONL files created after the session
+                const sessionCreated = new Date(session.createdAt || 0).getTime();
+                if (stat.mtimeMs > sessionCreated - 60000) { // 1 min tolerance
+                  jsonls.push({ uuid, mtime: stat.mtimeMs, size: stat.size });
+                }
+              }
+            } catch (_) {}
+          }
+
+          if (jsonls.length === 0) continue;
+
+          // Sort by mtime descending, pick the one closest to session creation
+          jsonls.sort((a, b) => {
+            const sessionCreated = new Date(session.createdAt || 0).getTime();
+            return Math.abs(a.mtime - sessionCreated) - Math.abs(b.mtime - sessionCreated);
+          });
+
+          const best = jsonls[0];
+          // Sanity check: only bind if the JSONL has some content (> 1KB)
+          if (best.size < 1024) continue;
+
+          console.log(`[Store] Orphan scan: binding session "${session.name}" (${sid.substring(0, 8)}) to JSONL ${best.uuid.substring(0, 8)}`);
+          const result = this.updateSession(sid, { resumeSessionId: best.uuid });
+          if (result) {
+            usedIds.add(best.uuid); // Prevent double-claim in same scan
+          }
+        }
+      } catch (e) {
+        // Non-fatal
+      }
+    }, 30000);
   }
 
   /**

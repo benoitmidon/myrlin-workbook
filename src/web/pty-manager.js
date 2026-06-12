@@ -721,7 +721,7 @@ class PtySessionManager {
       }
 
       const cancelWatch = waitForNewJsonl(
-        { candidateDirsFn: findCandidateDirs, snapshot: preSnapshot, timeoutMs: 8000, claudeProjectsDir: claudeDir },
+        { candidateDirsFn: findCandidateDirs, snapshot: preSnapshot, timeoutMs: 30000, claudeProjectsDir: claudeDir },
         (err, hit) => {
           if (err || !hit) {
             console.log(`[PTY] No new JSONL appeared for ${sessionId}; skipping resumeSessionId backfill`);
