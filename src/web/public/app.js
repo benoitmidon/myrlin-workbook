@@ -1944,7 +1944,9 @@ class CWMApp {
     // terminal.js. Fetching before initTerminalGroups means real specs are
     // available for both Claude and Codex panes on first paint.
     await this.fetchProviderSpecs();
-    // Load session metadata from SQLite for lazy placeholders
+    // Load sessions and metadata BEFORE terminal groups so lazy placeholders
+    // can show correct Running/Stopped status and first message.
+    await this.loadAll();
     try {
       this._sessionMeta = await this.api('GET', '/api/session-meta');
     } catch (_) {
@@ -1956,7 +1958,6 @@ class CWMApp {
     this.initNotesEditor();
     this.initAIInsights();
     this.initPairMobile();
-    await this.loadAll();
     this.connectSSE();
     this.startConflictChecks();
     this.checkForUpdates();
@@ -11438,26 +11439,54 @@ class CWMApp {
     if (titleEl) titleEl.textContent = sessionName || sessionId;
     const closeBtn = paneEl.querySelector('.terminal-pane-close');
     if (closeBtn) closeBtn.hidden = false;
-    // Show placeholder with first message if available
+    // Show toggle button with play icon (session is paused)
+    const toggleBtn = paneEl.querySelector('.terminal-pane-toggle');
+    if (toggleBtn) {
+      toggleBtn.hidden = false;
+      const stopIcon = toggleBtn.querySelector('.toggle-stop');
+      const playIcon = toggleBtn.querySelector('.toggle-play');
+      if (stopIcon) stopIcon.style.display = 'none';
+      if (playIcon) playIcon.style.display = '';
+      toggleBtn.title = 'Resume session';
+    }
+    // Register a sentinel in terminalPanes so the grid layout counts this pane
+    this.terminalPanes[slotIdx] = {
+      _lazy: true,
+      sessionId,
+      sessionName: sessionName || sessionId,
+      spawnOpts,
+      dispose: () => { this.terminalPanes[slotIdx] = null; },
+    };
+    // Show placeholder with status, first message, and connection prompt
     const termContainer = document.getElementById(`term-container-${slotIdx}`);
     if (termContainer) {
       const meta = this._sessionMeta && this._sessionMeta[sessionId];
       const firstMsg = meta && meta.firstMessage ? meta.firstMessage.substring(0, 200) : '';
       const startedAt = meta && meta.conversationStartedAt ? new Date(meta.conversationStartedAt).toLocaleDateString() : '';
+      // Check if the session is running or stopped
+      const sessionInfo = (this.state.allSessions || []).find(s => s && s.id === sessionId);
+      const isRunning = sessionInfo && sessionInfo.status === 'running';
+      const statusColor = isRunning ? 'var(--green)' : 'var(--subtext0)';
+      const statusLabel = isRunning ? 'Running' : 'Stopped';
+      const actionLabel = isRunning ? 'Click to reconnect' : 'Click to connect';
       termContainer.innerHTML = `<div class="lazy-placeholder" style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--subtext0);cursor:pointer;user-select:none;padding:20px;text-align:center;gap:12px;">
+        <div style="font-size:12px;color:${statusColor};font-weight:500;">${statusLabel}</div>
         <div style="font-size:13px;opacity:0.6;max-width:400px;line-height:1.4;font-style:italic;">${firstMsg ? '&ldquo;' + firstMsg.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '&hellip;&rdquo;' : ''}</div>
         ${startedAt ? '<div style="font-size:11px;opacity:0.4;">' + startedAt + '</div>' : ''}
-        <div style="font-size:14px;margin-top:8px;">Click to connect</div>
+        <div style="font-size:14px;margin-top:8px;">${actionLabel}</div>
       </div>`;
     }
-    // Activate on click
+    // Activate on click — listen on termContainer (not paneEl) to avoid
+    // intercepting clicks on header buttons (close, toggle, expand)
     const activateHandler = () => {
       paneEl.classList.remove('terminal-pane-lazy');
+      this.terminalPanes[slotIdx] = null;
       if (termContainer) termContainer.innerHTML = '';
       this.openTerminalInPane(slotIdx, sessionId, sessionName, spawnOpts);
-      paneEl.removeEventListener('click', activateHandler);
+      if (termContainer) termContainer.removeEventListener('click', activateHandler);
     };
-    paneEl.addEventListener('click', activateHandler);
+    if (termContainer) termContainer.addEventListener('click', activateHandler);
+    this.updateTerminalGridLayout();
   }
 
   openTerminalInPane(slotIdx, sessionId, sessionName, spawnOpts) {
@@ -11542,6 +11571,43 @@ class CWMApp {
     if (micBtn2 && this._speechRecognitionAvailable) micBtn2.hidden = false;
     const expandBtn2 = paneEl.querySelector('.terminal-pane-expand');
     if (expandBtn2) expandBtn2.hidden = false;
+    // Stop/Resume toggle button
+    const toggleBtn = paneEl.querySelector('.terminal-pane-toggle');
+    if (toggleBtn) {
+      toggleBtn.hidden = false;
+      const stopIcon = toggleBtn.querySelector('.toggle-stop');
+      const playIcon = toggleBtn.querySelector('.toggle-play');
+      // Show stop icon (session is running since we're opening a terminal)
+      if (stopIcon) stopIcon.style.display = '';
+      if (playIcon) playIcon.style.display = 'none';
+      toggleBtn.title = 'Stop session';
+      toggleBtn.onclick = async () => {
+        const tp = this.terminalPanes[slotIdx];
+        if (tp && !tp._lazy) {
+          // Stop: kill PTY server-side, dispose terminal, show placeholder
+          try { await this.api('POST', `/api/pty/${encodeURIComponent(sessionId)}/kill`); } catch (_) {}
+          tp.dispose();
+          this.terminalPanes[slotIdx] = null;
+          // Update local session status so placeholder shows "Stopped"
+          const sess = (this.state.allSessions || []).find(s => s && s.id === sessionId);
+          if (sess) sess.status = 'stopped';
+          const termContainer = document.getElementById(`term-container-${slotIdx}`);
+          if (termContainer) termContainer.innerHTML = '';
+          paneEl.classList.remove('terminal-pane-empty');
+          this.showLazyPlaceholder(slotIdx, sessionId, sessionName, spawnOpts);
+        } else {
+          // Resume: clear lazy placeholder and connect the terminal
+          if (this.terminalPanes[slotIdx] && this.terminalPanes[slotIdx].dispose) {
+            this.terminalPanes[slotIdx].dispose();
+          }
+          this.terminalPanes[slotIdx] = null;
+          const termContainer = document.getElementById(`term-container-${slotIdx}`);
+          if (termContainer) termContainer.innerHTML = '';
+          paneEl.classList.remove('terminal-pane-lazy');
+          this.openTerminalInPane(slotIdx, sessionId, sessionName, spawnOpts);
+        }
+      };
+    }
 
     // Create and mount TerminalPane
     const tp = new TerminalPane(containerId, sessionId, sessionName, spawnOpts);
@@ -14789,9 +14855,14 @@ class CWMApp {
           // inside openTerminalInPane handles that case (lookup-then-claude).
           const opts = { ...(p.spawnOpts || {}) };
           if (p.provider && !opts.provider) opts.provider = p.provider;
-          // Lazy spawn: show placeholder instead of connecting immediately.
-          // The terminal only connects when the user clicks on the pane.
-          this.showLazyPlaceholder(p.slot, p.sessionId, p.sessionName || 'Terminal', opts);
+          // Running sessions connect immediately; stopped sessions show lazy placeholder
+          const sessionInfo = (this.state.allSessions || []).find(s => s && s.id === p.sessionId);
+          const isRunning = sessionInfo && sessionInfo.status === 'running';
+          if (isRunning) {
+            this.openTerminalInPane(p.slot, p.sessionId, p.sessionName || 'Terminal', opts);
+          } else {
+            this.showLazyPlaceholder(p.slot, p.sessionId, p.sessionName || 'Terminal', opts);
+          }
           if (p.viewType) {
             setTimeout(() => this.openViewInPane(p.slot, p.viewType, p.viewData || {}), 100);
           }
@@ -15229,12 +15300,18 @@ class CWMApp {
         }
       });
     } else {
-      // No cache — show lazy placeholders (connect only on click)
+      // No cache — running sessions connect, stopped sessions show lazy placeholder
       const group = this._tabGroups.find(g => g.id === groupId);
       if (group && group.panes) {
         group.panes.forEach(p => {
           if (p.sessionId && !this.terminalPanes[p.slot]) {
-            this.showLazyPlaceholder(p.slot, p.sessionId, p.sessionName || 'Terminal', p.spawnOpts || {});
+            const sessionInfo = (this.state.allSessions || []).find(s => s && s.id === p.sessionId);
+            const isRunning = sessionInfo && sessionInfo.status === 'running';
+            if (isRunning) {
+              this.openTerminalInPane(p.slot, p.sessionId, p.sessionName || 'Terminal', p.spawnOpts || {});
+            } else {
+              this.showLazyPlaceholder(p.slot, p.sessionId, p.sessionName || 'Terminal', p.spawnOpts || {});
+            }
           }
         });
       }
