@@ -325,6 +325,7 @@ class Store extends EventEmitter {
           ([, s]) => !s.resumeSessionId && s.workingDir && s.status === 'running'
         );
         if (orphanSessions.length === 0) return;
+        console.log(`[Store] Orphan scan: ${orphanSessions.length} session(s) without resumeSessionId`);
 
         for (const [sid, session] of orphanSessions) {
           const cwd = session.workingDir;
@@ -332,8 +333,9 @@ class Store extends EventEmitter {
           if (!scanFs.existsSync(claudeDir)) continue;
           const candidateDirs = scanFs.readdirSync(claudeDir).filter(d => {
             try {
-              const decoded = decodeURIComponent(d);
-              return decoded.replace(/[/\\]/g, scanPath.sep) === cwd.replace(/[/\\]/g, scanPath.sep);
+              // Claude encodes paths by replacing / with - (e.g. /home/dev/Sites -> -home-dev-Sites)
+              const cwdEncoded = cwd.replace(/\//g, '-');
+              return d === cwdEncoded;
             } catch (_) { return false; }
           });
 
