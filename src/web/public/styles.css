@@ -5190,6 +5190,12 @@ body.cwm-dragging .sidebar-backdrop {
   border: 1px solid var(--blue); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 .terminal-container { flex: 1; overflow: hidden; transition: filter 150ms ease; }
+/* Allow native text selection in xterm when the xterm selection system fails
+   (e.g. DOM renderer on certain environments). Without this, user-select:none
+   from xterm.css makes the selection invisible to window.getSelection(). */
+.terminal-container .xterm .xterm-screen,
+.terminal-container .xterm .xterm-rows,
+.terminal-container .xterm .xterm-helpers { user-select: text !important; -webkit-user-select: text !important; }
 .terminal-pane-empty .terminal-container {
   display: flex; align-items: center; justify-content: center;
   border: 2px dashed var(--surface1); margin: 8px;
