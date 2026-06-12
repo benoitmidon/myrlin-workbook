@@ -1776,6 +1776,29 @@
       document.addEventListener('touchcancel', stop, { passive: true });
     })();
   </script>
+  <!-- Global Cmd+C / Ctrl+C fallback for native text selection in terminals.
+       xterm's custom key handler only fires when its hidden textarea has focus.
+       When the user selects text natively (blue highlight instead of xterm's
+       purple), xterm doesn't have focus and Cmd+C does nothing. This global
+       listener catches that case. -->
+  <script>
+    document.addEventListener('keydown', function(e) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'c') {
+        var sel = window.getSelection();
+        var text = sel ? sel.toString() : '';
+        if (text.trim().length > 0) {
+          var ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.cssText = 'position:fixed;left:-9999px;opacity:0';
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand('copy'); } catch(x) {}
+          document.body.removeChild(ta);
+          try { navigator.clipboard.writeText(text).catch(function(){}); } catch(x) {}
+        }
+      }
+    });
+  </script>
   <!-- Polyfills HTML5 drag-and-drop on touch devices (translates touch -> drag events).
        isPressHoldMode requires a 350ms hold before drag arms, so normal swipe
        gestures on the sidebar and tab strip pass through to native scroll

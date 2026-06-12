@@ -383,30 +383,23 @@ class TerminalPane {
         const mod = e.ctrlKey || e.metaKey;
 
         // Ctrl+C / Cmd+C: copy selected text to clipboard (if selection exists)
-        // Without selection, fall through so xterm sends \x03 (SIGINT) normally
-        if (mod && e.key === 'c' && this.term.hasSelection()) {
-          const text = this.term.getSelection();
-          // Try modern clipboard API first, fall back to execCommand for
-          // contexts where navigator.clipboard is blocked (e.g. Cloudflare tunnels)
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).catch(() => {
-              const ta = document.createElement('textarea');
-              ta.value = text;
-              ta.style.cssText = 'position:fixed;left:-9999px';
-              document.body.appendChild(ta);
-              ta.select();
-              document.execCommand('copy');
-              document.body.removeChild(ta);
-            });
-          } else {
-            const ta = document.createElement('textarea');
-            ta.value = text;
-            ta.style.cssText = 'position:fixed;left:-9999px';
-            document.body.appendChild(ta);
-            ta.select();
-            document.execCommand('copy');
-            document.body.removeChild(ta);
-          }
+        // Check both xterm selection AND native browser selection (fallback when
+        // xterm's DOM renderer doesn't capture mouse events for selection)
+        const nativeSel = window.getSelection();
+        const hasNativeSel = nativeSel && nativeSel.toString().trim().length > 0;
+        if (mod && e.key === 'c' && (this.term.hasSelection() || hasNativeSel)) {
+          const text = this.term.hasSelection() ? this.term.getSelection() : nativeSel.toString();
+          // Use textarea+execCommand as primary method — navigator.clipboard
+          // is blocked on Cloudflare tunnel origins even over HTTPS.
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.cssText = 'position:fixed;left:-9999px;opacity:0';
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand('copy'); } catch (_) {}
+          document.body.removeChild(ta);
+          // Also try modern API as belt-and-suspenders
+          try { navigator.clipboard.writeText(text).catch(() => {}); } catch (_) {}
           this.term.clearSelection();
           return false;
         }

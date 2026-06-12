@@ -11449,13 +11449,19 @@ class CWMApp {
       if (playIcon) playIcon.style.display = '';
       toggleBtn.title = 'Resume session';
     }
-    // Register a sentinel in terminalPanes so the grid layout counts this pane
+    // Register a sentinel in terminalPanes so the grid layout counts this pane.
+    // Include no-op stubs for methods that may be called on any pane entry
+    // (blur, focus, setFocused, safeFit) to prevent crashes.
     this.terminalPanes[slotIdx] = {
       _lazy: true,
       sessionId,
       sessionName: sessionName || sessionId,
       spawnOpts,
       dispose: () => { this.terminalPanes[slotIdx] = null; },
+      blur: () => {},
+      focus: () => {},
+      setFocused: () => {},
+      safeFit: () => {},
     };
     // Show placeholder with status, first message, and connection prompt
     const termContainer = document.getElementById(`term-container-${slotIdx}`);
@@ -13059,7 +13065,7 @@ class CWMApp {
 
     // Blur all other terminals and mark them as background (throttled rendering)
     this.terminalPanes.forEach((tp, i) => {
-      if (tp && i !== slotIdx) {
+      if (tp && i !== slotIdx && !tp._lazy) {
         tp.blur();
         tp.setFocused(false);
       }
@@ -13072,7 +13078,7 @@ class CWMApp {
     if (pane) pane.classList.add('terminal-pane-active');
 
     const tp = this.terminalPanes[slotIdx];
-    if (tp) {
+    if (tp && !tp._lazy) {
       tp.setFocused(true);
       tp.focus();
     }
