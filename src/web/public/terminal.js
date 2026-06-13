@@ -312,6 +312,12 @@ class TerminalPane {
         lineHeight: 1.2,
         scrollback: 5000,
         rightClickSelectsWord: false,
+        // Enable Alt+click force-selection on macOS. Without this, text
+        // selection is impossible when the PTY application enables mouse
+        // tracking (Claude Code Ink TUI, tmux, vim, etc.). The force-
+        // selection shim below injects altKey automatically so users can
+        // select text with normal click+drag.
+        macOptionClickForcesSelection: true,
         theme: TerminalPane.getCurrentTheme(),
       });
 
@@ -324,6 +330,17 @@ class TerminalPane {
 
       this.term.open(container);
       this._log('xterm opened in ' + this.containerId + ' for session ' + this.sessionId);
+
+      // ── Force-selection shim for mouse-tracking mode ────────────
+      // When the PTY application enables mouse tracking (e.g., Claude Code's
+      // Ink TUI), xterm.js adds the 'enable-mouse-events' class and forwards
+      // all mouse clicks to the PTY instead of doing text selection.
+      // On Linux, Shift+click forces selection; on macOS, Alt+click does.
+      // For a web-based terminal manager, users expect normal click+drag to
+      // select text. This shim intercepts mouse events in the capture phase
+      // and re-dispatches them with shiftKey=true when mouse tracking is
+      // active, triggering xterm.js's built-in force-selection mode.
+      this._initForceSelectionShim(container);
 
       // Plan 19-02 (PTY-04, PTY-05): read this pane's provider tag once at
       // mount time. data-provider is set by app.js openTerminalInPane (and by
@@ -776,271 +793,14 @@ class TerminalPane {
     return ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
   }
 
-  /**
-   * Initialize mobile input mode - called after terminal mounts.
-   * Uses CSS pointer-events to prevent touch from focusing xterm's hidden
-   * textarea (which triggers the keyboard). Toolbar buttons send via WebSocket
-   * directly and don't need the textarea. The "Type" button toggles
-   * pointer-events to allow keyboard input when explicitly requested.
-   */
-  initMobileInputMode() {
-    if (!this._isMobile() || !this.term) return;
+  /* ── Mobile input + mouse-selection ──────────────────────────────
+     The following methods were extracted to terminal-input.js, which mixes
+     them into TerminalPane.prototype (loaded right after terminal.js):
+       initMobileInputMode, _enableMobileSelection, _disableMobileSelection,
+       _initForceSelectionShim, setMobileTypeMode, setMobileScrollMode,
+       toggleMobileInputMode
+     See .claude/memory/terminal-input-selection.md for the rationale. */
 
-    this._mobileTypeMode = false;
-    this._mobileSelecting = false;
-
-    const container = document.getElementById(this.containerId);
-    if (!container) return;
-    const textarea = container.querySelector('.xterm-helper-textarea');
-    if (!textarea) return;
-
-    this._xtermTextarea = textarea;
-    this._xtermScreen = container.querySelector('.xterm-screen');
-    this._xtermViewport = container.querySelector('.xterm-viewport');
-
-    // Disable mobile keyboard autocomplete/autocorrect/spellcheck.
-    // These use IME composition events that xterm.js mishandles,
-    // causing duplicated/garbled text injection.
-    textarea.setAttribute('autocomplete', 'off');
-    textarea.setAttribute('autocorrect', 'off');
-    textarea.setAttribute('autocapitalize', 'off');
-    textarea.setAttribute('spellcheck', 'false');
-
-    // Default to scroll mode: block touch from reaching textarea and screen.
-    // textarea: prevents keyboard popup on scroll
-    // screen: block xterm.js's internal touch handling that calls preventDefault
-    textarea.style.pointerEvents = 'none';
-    if (this._xtermScreen) this._xtermScreen.style.pointerEvents = 'none';
-
-    // ── Manual touch-scroll with momentum ──────────────────────────
-    // Why manual? xterm.js registers touch/wheel handlers on .xterm-viewport
-    // and .xterm that call preventDefault(), blocking native browser scroll
-    // even when pointer-events: none is set on .xterm-screen (events still
-    // bubble from viewport to .xterm where xterm.js intercepts them).
-    //
-    // This handler intercepts touches at our container level (capture phase)
-    // and uses term.scrollLines() — xterm.js's own scroll API — so that
-    // internal scroll state (ydisp) stays in sync. Without this, xterm.js
-    // doesn't know the user has scrolled up and snaps back to the bottom
-    // on every new PTY output line.
-    //
-    // Long-press (400ms hold) switches to xterm.js selection mode so the
-    // user can highlight text without triggering the keyboard.
-
-    // Line height in pixels: used to convert touch pixel deltas to line counts.
-    const fontSize = (this.term.options && this.term.options.fontSize) || 13;
-    const lineHeightMult = (this.term.options && this.term.options.lineHeight) || 1.2;
-    const lineHeightPx = Math.ceil(fontSize * lineHeightMult);
-
-    let startY = 0;          // Touch start Y position
-    let lastY = 0;           // Previous touchmove Y
-    let lastTime = 0;        // Previous touchmove timestamp
-    let velocity = 0;        // Scroll velocity for momentum (px/ms)
-    let momentumRaf = null;  // rAF ID for momentum animation
-    let isScrolling = false; // Whether we detected a scroll gesture
-    let longPressTimer = null;
-    let scrollAccum = 0;     // Sub-line pixel accumulator for smooth scrolling
-    let lastMomentumTime = 0;
-    const LONG_PRESS_MS = 400;
-    const MOVE_THRESHOLD = 8;  // px — must move this far to be a scroll
-    const FRICTION = 0.92;     // Momentum deceleration (per 16ms equivalent)
-    const MIN_VELOCITY = 0.1;  // Stop momentum below this (px/ms)
-
-    /** Cancel any running momentum animation */
-    const stopMomentum = () => {
-      if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = null; }
-      velocity = 0;
-    };
-
-    /**
-     * Scroll by a pixel amount using xterm.js's scrollLines() API.
-     * Using the API (not direct scrollTop) keeps xterm.js's internal ydisp
-     * in sync, so new output doesn't snap the view back to the bottom.
-     * scrollLines(n): negative = toward top (older content), positive = toward bottom.
-     * Finger moving down (px > 0) should show older content → scrollLines(negative).
-     */
-    const scrollByPixels = (px) => {
-      scrollAccum += px / lineHeightPx;
-      const linesToScroll = Math.trunc(scrollAccum);
-      if (linesToScroll !== 0) {
-        scrollAccum -= linesToScroll;
-        this.term.scrollLines(-linesToScroll);
-      }
-    };
-
-    /** Animate momentum scroll after finger lifts (time-based, works at any Hz) */
-    const animateMomentum = (timestamp) => {
-      if (lastMomentumTime === 0) lastMomentumTime = timestamp;
-      const dt = Math.min(timestamp - lastMomentumTime, 64); // cap at 64ms (tab switches)
-      lastMomentumTime = timestamp;
-      velocity *= Math.pow(FRICTION, dt / 16); // scale decay to actual frame time
-      if (Math.abs(velocity) < MIN_VELOCITY) { stopMomentum(); return; }
-      scrollByPixels(velocity * dt);
-      momentumRaf = requestAnimationFrame(animateMomentum);
-    };
-
-    const onTouchStart = (e) => {
-      // In type mode, let xterm.js handle everything
-      if (this._mobileTypeMode) return;
-      // If currently selecting, let xterm handle
-      if (this._mobileSelecting) return;
-
-      // Block xterm.js from seeing this event (it calls preventDefault)
-      e.stopPropagation();
-      stopMomentum();
-      const touch = e.touches[0];
-      startY = touch.clientY;
-      lastY = touch.clientY;
-      lastTime = Date.now();
-      velocity = 0;
-      isScrolling = false;
-      scrollAccum = 0;
-
-      // Start long-press timer for text selection
-      longPressTimer = setTimeout(() => {
-        longPressTimer = null;
-        if (!isScrolling) this._enableMobileSelection();
-      }, LONG_PRESS_MS);
-    };
-
-    const onTouchMove = (e) => {
-      if (this._mobileTypeMode) return;
-      // If selecting, let xterm.js handle the selection drag
-      if (this._mobileSelecting) return;
-
-      // Block xterm.js from seeing this event
-      e.stopPropagation();
-
-      const touch = e.touches[0];
-      const deltaY = touch.clientY - lastY;
-      const totalDelta = Math.abs(touch.clientY - startY);
-      const now = Date.now();
-      const dt = now - lastTime;
-
-      // Once movement exceeds threshold, it's a scroll — cancel long-press
-      if (!isScrolling && totalDelta > MOVE_THRESHOLD) {
-        isScrolling = true;
-        if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-      }
-
-      if (isScrolling) {
-        // Prevent default browser scroll (e.g. pull-to-refresh on Chrome mobile/tablet)
-        if (e.cancelable) e.preventDefault();
-        
-        // Scroll via xterm.js API so ydisp stays in sync (prevents snap-back on output)
-        scrollByPixels(deltaY);
-        // Track velocity for momentum (smoothed exponential average)
-        if (dt > 0) {
-          const instantV = deltaY / dt;
-          velocity = velocity * 0.6 + instantV * 0.4;
-        }
-      }
-
-      lastY = touch.clientY;
-      lastTime = now;
-    };
-
-    const onTouchEnd = (e) => {
-      if (!this._mobileTypeMode && !this._mobileSelecting) e.stopPropagation();
-      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-
-      // If we were selecting, revert after a delay for xterm.js to process
-      if (this._mobileSelecting) {
-        setTimeout(() => this._disableMobileSelection(), 300);
-        return;
-      }
-
-      if (this._mobileTypeMode) return;
-
-      // Start momentum animation if finger was moving fast enough
-      if (isScrolling && Math.abs(velocity) > MIN_VELOCITY) {
-        lastMomentumTime = 0;
-        momentumRaf = requestAnimationFrame(animateMomentum);
-      }
-      isScrolling = false;
-    };
-
-    // Use CAPTURE phase to intercept before xterm.js gets the events.
-    // Non-passive so we can prevent xterm from seeing the events in scroll mode
-    // AND prevent browser pull-to-refresh (overscroll) on mobile/tablet.
-    container.addEventListener('touchstart', onTouchStart, { capture: true, passive: false });
-    container.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
-    container.addEventListener('touchend', onTouchEnd, { capture: true, passive: false });
-    container.addEventListener('touchcancel', onTouchEnd, { capture: true, passive: false });
-
-    // Store cleanup function for dispose()
-    this._touchScrollCleanup = () => {
-      clearTimeout(longPressTimer);
-      stopMomentum();
-      container.removeEventListener('touchstart', onTouchStart, { capture: true });
-      container.removeEventListener('touchmove', onTouchMove, { capture: true });
-      container.removeEventListener('touchend', onTouchEnd, { capture: true });
-      container.removeEventListener('touchcancel', onTouchEnd, { capture: true });
-    };
-  }
-
-  /**
-   * Temporarily enable xterm.js touch handling for text selection (long-press).
-   * Re-enables pointer-events on .xterm-screen so xterm handles selection,
-   * but keeps textarea pointer-events disabled to prevent keyboard popup.
-   */
-  _enableMobileSelection() {
-    this._mobileSelecting = true;
-    if (this._xtermScreen) this._xtermScreen.style.pointerEvents = 'auto';
-    // Haptic feedback if available (subtle vibration signals selection mode)
-    if (navigator.vibrate) navigator.vibrate(25);
-  }
-
-  /**
-   * Disable xterm.js touch handling after selection ends.
-   * Reverts .xterm-screen to pointer-events: none for scroll passthrough.
-   */
-  _disableMobileSelection() {
-    this._mobileSelecting = false;
-    if (this._xtermScreen && !this._mobileTypeMode) {
-      this._xtermScreen.style.pointerEvents = 'none';
-    }
-  }
-
-  /**
-   * Switch to type mode - keyboard appears, user can type into terminal.
-   * Restores pointer-events on both textarea (keyboard input) and screen
-   * (xterm.js touch handling for cursor/selection).
-   */
-  setMobileTypeMode() {
-    if (!this._xtermTextarea || !this.term) return;
-    this._mobileTypeMode = true;
-    this._xtermTextarea.style.pointerEvents = 'auto';
-    if (this._xtermScreen) this._xtermScreen.style.pointerEvents = 'auto';
-    this.term.focus();
-    if (this.onMobileModeChange) this.onMobileModeChange('type');
-  }
-
-  /**
-   * Switch to scroll mode - keyboard hidden, touch scrolls terminal output.
-   * Disables pointer-events on textarea (prevents keyboard popup) and screen
-   * (lets touches pass through to viewport for native compositor-thread scroll).
-   */
-  setMobileScrollMode() {
-    if (!this._xtermTextarea) return;
-    this._mobileTypeMode = false;
-    this._xtermTextarea.style.pointerEvents = 'none';
-    if (this._xtermScreen) this._xtermScreen.style.pointerEvents = 'none';
-    if (this.term) this.term.blur();
-    if (this.onMobileModeChange) this.onMobileModeChange('scroll');
-  }
-
-  /**
-   * Toggle between scroll and type mode
-   */
-  toggleMobileInputMode() {
-    if (this._mobileTypeMode) {
-      this.setMobileScrollMode();
-    } else {
-      this.setMobileTypeMode();
-    }
-    return this._mobileTypeMode;
-  }
 
   /* ═══════════════════════════════════════════════════════════
      WRITE BATCHING
@@ -1454,6 +1214,7 @@ class TerminalPane {
     this._writeBuf = '';
     this._activitySample = '';
     if (this._touchScrollCleanup) this._touchScrollCleanup();
+    if (this._forceSelectionCleanup) this._forceSelectionCleanup();
     if (this._resizeObserver) this._resizeObserver.disconnect();
     if (this.ws) { this.ws.onmessage = null; this.ws.onclose = null; this.ws.close(); }
     if (this.term) this.term.dispose();
