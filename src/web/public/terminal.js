@@ -312,6 +312,12 @@ class TerminalPane {
         lineHeight: 1.2,
         scrollback: 5000,
         rightClickSelectsWord: false,
+        // Enable Alt+click force-selection on macOS. Without this, text
+        // selection is impossible when the PTY application enables mouse
+        // tracking (Claude Code Ink TUI, tmux, vim, etc.). The force-
+        // selection shim below injects altKey automatically so users can
+        // select text with normal click+drag.
+        macOptionClickForcesSelection: true,
         theme: TerminalPane.getCurrentTheme(),
       });
 
@@ -324,6 +330,17 @@ class TerminalPane {
 
       this.term.open(container);
       this._log('xterm opened in ' + this.containerId + ' for session ' + this.sessionId);
+
+      // ── Force-selection shim for mouse-tracking mode ────────────
+      // When the PTY application enables mouse tracking (e.g., Claude Code's
+      // Ink TUI), xterm.js adds the 'enable-mouse-events' class and forwards
+      // all mouse clicks to the PTY instead of doing text selection.
+      // On Linux, Shift+click forces selection; on macOS, Alt+click does.
+      // For a web-based terminal manager, users expect normal click+drag to
+      // select text. This shim intercepts mouse events in the capture phase
+      // and re-dispatches them with shiftKey=true when mouse tracking is
+      // active, triggering xterm.js's built-in force-selection mode.
+      this._initForceSelectionShim(container);
 
       // Plan 19-02 (PTY-04, PTY-05): read this pane's provider tag once at
       // mount time. data-provider is set by app.js openTerminalInPane (and by
@@ -1002,6 +1019,107 @@ class TerminalPane {
     }
   }
 
+  /* ═══════════════════════════════════════════════════════════
+     FORCE-SELECTION SHIM
+     When the PTY application enables mouse tracking (Claude Code Ink TUI,
+     tmux, vim, etc.), xterm.js forwards all mouse events to the PTY instead
+     of performing text selection. On real terminal emulators this is fine
+     because the user knows to hold Shift (Linux) or Alt (macOS) to force
+     selection. In a web-based terminal manager, this UX is confusing --
+     users expect normal click+drag to select text.
+
+     This shim intercepts mouse events in the capture phase on .xterm-screen
+     and re-dispatches them with shiftKey=true when mouse tracking is active.
+     xterm.js's SelectionService.shouldForceSelection() checks event.shiftKey
+     (on non-Mac) and enters force-selection mode, bypassing mouse reporting.
+
+     The shim only activates when the .xterm element has the
+     'enable-mouse-events' class (set by xterm.js when the PTY sends mouse
+     tracking escape sequences like \e[?1000h). When mouse tracking is off,
+     mouse events pass through unmodified.
+     ═══════════════════════════════════════════════════════════ */
+
+  /**
+   * Install capture-phase mouse event interceptors on .xterm-screen.
+   * When mouse tracking is active, re-dispatch events with shiftKey=true
+   * so xterm.js enters force-selection mode instead of sending mouse reports.
+   * @param {HTMLElement} container - The terminal container element
+   */
+  _initForceSelectionShim(container) {
+    const xtermEl = container.querySelector('.xterm');
+    const screenEl = container.querySelector('.xterm-screen');
+    if (!xtermEl || !screenEl) return;
+
+    // Events to intercept: the full mouse lifecycle for selection
+    const EVENTS = ['mousedown', 'mousemove', 'mouseup'];
+
+    // Tag property to distinguish shimmed events from originals.
+    // We can't use isTrusted (read-only) so we set a custom property.
+    const SHIM_TAG = '_forceSelectionShim';
+
+    const interceptor = (e) => {
+      // Let our own re-dispatched events pass through untouched
+      if (e[SHIM_TAG]) return;
+      // Only intercept when mouse tracking is active
+      if (!xtermEl.classList.contains('enable-mouse-events')) return;
+      // Don't intercept if user is already holding a force-selection modifier
+      // (Shift on Linux, Alt/Option on macOS) — let xterm.js handle natively
+      if (e.shiftKey || e.altKey) return;
+      // Don't intercept right-clicks (context menu)
+      if (e.button !== 0) return;
+      // Don't intercept if a modifier key is held (Ctrl+click, etc.)
+      if (e.ctrlKey || e.metaKey) return;
+
+      // Stop the original event completely: stopImmediatePropagation
+      // prevents xterm.js handlers on the SAME element from seeing it,
+      // and stopPropagation prevents child/parent propagation.
+      e.stopImmediatePropagation();
+      e.preventDefault();
+
+      // Re-dispatch with force-selection modifiers so xterm.js enters
+      // force-selection mode. xterm.js checks shiftKey on Linux/Windows
+      // and altKey (with macOptionClickForcesSelection) on macOS. Since
+      // the browser reports the CLIENT platform (Mac user accessing Linux
+      // server via tunnel shows as MacIntel), we set BOTH modifiers.
+      const shimEvent = new MouseEvent(e.type, {
+        bubbles: e.bubbles,
+        cancelable: e.cancelable,
+        view: e.view,
+        detail: e.detail,
+        screenX: e.screenX,
+        screenY: e.screenY,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        button: e.button,
+        buttons: e.buttons,
+        relatedTarget: e.relatedTarget,
+        // Both modifiers for cross-platform force-selection
+        shiftKey: true,
+        ctrlKey: e.ctrlKey,
+        altKey: true,
+        metaKey: e.metaKey,
+      });
+      // Tag so our own interceptor lets it pass
+      shimEvent[SHIM_TAG] = true;
+      // Dispatch on the original target so xterm.js handlers see it
+      e.target.dispatchEvent(shimEvent);
+    };
+
+    // Register on the CONTAINER (parent of .xterm) in capture phase.
+    // This ensures our interceptor fires BEFORE xterm.js's own handlers
+    // on .xterm-screen, regardless of registration order.
+    for (const evt of EVENTS) {
+      container.addEventListener(evt, interceptor, { capture: true });
+    }
+
+    // Store cleanup reference for dispose()
+    this._forceSelectionCleanup = () => {
+      for (const evt of EVENTS) {
+        container.removeEventListener(evt, interceptor, { capture: true });
+      }
+    };
+  }
+
   /**
    * Switch to type mode - keyboard appears, user can type into terminal.
    * Restores pointer-events on both textarea (keyboard input) and screen
@@ -1454,6 +1572,7 @@ class TerminalPane {
     this._writeBuf = '';
     this._activitySample = '';
     if (this._touchScrollCleanup) this._touchScrollCleanup();
+    if (this._forceSelectionCleanup) this._forceSelectionCleanup();
     if (this._resizeObserver) this._resizeObserver.disconnect();
     if (this.ws) { this.ws.onmessage = null; this.ws.onclose = null; this.ws.close(); }
     if (this.term) this.term.dispose();

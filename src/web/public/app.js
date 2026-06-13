@@ -11487,11 +11487,16 @@ class CWMApp {
     const activateHandler = () => {
       paneEl.classList.remove('terminal-pane-lazy');
       this.terminalPanes[slotIdx] = null;
-      if (termContainer) termContainer.innerHTML = '';
+      if (termContainer) {
+        termContainer.innerHTML = '';
+        termContainer.removeEventListener('click', activateHandler);
+      }
       this.openTerminalInPane(slotIdx, sessionId, sessionName, spawnOpts);
-      if (termContainer) termContainer.removeEventListener('click', activateHandler);
     };
     if (termContainer) termContainer.addEventListener('click', activateHandler);
+    // Store reference on sentinel for cleanup in closeTerminalPane
+    this.terminalPanes[slotIdx]._activateHandler = activateHandler;
+    this.terminalPanes[slotIdx]._termContainer = termContainer;
     this.updateTerminalGridLayout();
   }
 
@@ -12446,6 +12451,10 @@ class CWMApp {
     const sessionName = tp ? tp.sessionName : '';
 
     if (tp) {
+      // Clean up lazy placeholder click handler if it exists
+      if (tp._activateHandler && tp._termContainer) {
+        tp._termContainer.removeEventListener('click', tp._activateHandler);
+      }
       // Dispose disconnects the WebSocket but the PTY keeps running in the background
       tp.dispose();
       this.terminalPanes[slotIdx] = null;
@@ -12490,6 +12499,11 @@ class CWMApp {
     if (activityEl) activityEl.innerHTML = '';
     const container = document.getElementById(`term-container-${slotIdx}`);
     if (container) container.innerHTML = '';
+    // Reset the toggle button to remove stale onclick handlers
+    const toggleBtn = paneEl.querySelector('.terminal-pane-toggle');
+    if (toggleBtn) { toggleBtn.hidden = true; toggleBtn.onclick = null; }
+    // Remove lazy class to prevent stale lazy state
+    paneEl.classList.remove('terminal-pane-lazy');
 
     // If closing the active pane, focus another terminal
     if (this._activeTerminalSlot === slotIdx) {
