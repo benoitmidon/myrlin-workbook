@@ -89,14 +89,39 @@
         velocity = 0;
       };
 
+      // Mouse-tracking apps (full-screen TUIs like Claude Code's Ink) repaint in
+      // place and keep NO xterm scrollback, so term.scrollLines() is a no-op. In
+      // that mode scrolling must be sent to the PTY as wheel events; xterm
+      // translates a wheel event into an SGR mouse-wheel report. We detect the
+      // mode via the 'enable-mouse-events' class xterm sets on \e[?1000h etc.
+      const xtermEl = container.querySelector('.xterm');
+      let wheelAccum = 0;            // Sub-step pixel accumulator for wheel forwarding
+      const WHEEL_STEP_PX = 24;      // px of drag per emitted wheel tick
+
       /**
-       * Scroll by a pixel amount using xterm.js's scrollLines() API.
-       * Using the API (not direct scrollTop) keeps xterm.js's internal ydisp
-       * in sync, so new output doesn't snap the view back to the bottom.
+       * Scroll by a pixel amount.
+       * - PTY mouse-tracking active → forward as wheel events to the PTY (the TUI
+       *   scrolls its own content; xterm has no scrollback to move).
+       * - otherwise → scroll xterm's own scrollback via scrollLines().
        * scrollLines(n): negative = toward top (older content), positive = toward bottom.
-       * Finger moving down (px > 0) should show older content → scrollLines(negative).
+       * Finger moving down (px > 0) shows older content (wheel up / scrollLines negative).
        */
       const scrollByPixels = (px) => {
+        if (xtermEl && xtermEl.classList.contains('enable-mouse-events') && this._xtermViewport) {
+          wheelAccum += px;
+          const r = this._xtermViewport.getBoundingClientRect();
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          while (Math.abs(wheelAccum) >= WHEEL_STEP_PX) {
+            const dir = wheelAccum > 0 ? 1 : -1;   // finger down → wheel up (older content)
+            this._xtermViewport.dispatchEvent(new WheelEvent('wheel', {
+              deltaY: -dir * 120, deltaMode: 0, clientX: cx, clientY: cy,
+              bubbles: true, cancelable: true,
+            }));
+            wheelAccum -= dir * WHEEL_STEP_PX;
+          }
+          return;
+        }
         scrollAccum += px / lineHeightPx;
         const linesToScroll = Math.trunc(scrollAccum);
         if (linesToScroll !== 0) {
